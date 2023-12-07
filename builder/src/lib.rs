@@ -1,14 +1,23 @@
+use std::ops::Not;
+
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
-use syn::{parse_macro_input, Data, DataStruct, DeriveInput, Fields, FieldsNamed, Ident, Type};
+use syn::{
+    parse_macro_input, AngleBracketedGenericArguments, Data, DataStruct, DeriveInput, Fields,
+    FieldsNamed, GenericArgument, Ident, Meta, MetaNameValue, Path, PathArguments, PathSegment,
+    Type, TypePath,
+};
 
 /// Information about the fields that are going to be generated.
+#[derive(Debug)]
 struct GenField {
     ident: Ident,
     ty: Type,
+    is_optional: bool,
+    each: Option<Ident>,
 }
 
-#[proc_macro_derive(Builder)]
+#[proc_macro_derive(Builder, attributes(builder))]
 pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     let DeriveInput { ident, data, .. } = parse_macro_input!(input as DeriveInput);
     let fields = if let Data::Struct(DataStruct {
@@ -18,9 +27,54 @@ pub fn derive(input: proc_macro::TokenStream) -> proc_macro::TokenStream {
     {
         named
             .into_iter()
-            .map(|field| GenField {
-                ident: field.ident.expect("named fields"),
-                ty: field.ty,
+            .map(|field| {
+                let (ty, is_optional) = if let Type::Path(TypePath {
+                    qself: None,
+                    path: Path { ref segments, .. },
+                }) = field.ty
+                {
+                    #[rustfmt::skip]
+                    let PathSegment { ident, arguments: args }
+                        = segments.first().expect("has items");
+
+                    if ident != "Option" {
+                        (field.ty, false)
+                    } else {
+                        #[rustfmt::skip]
+                        let PathArguments::AngleBracketed(
+                            AngleBracketedGenericArguments { args, .. }
+                        ) = args else { unreachable!() };
+
+                        #[rustfmt::skip]
+                        let GenericArgument::Type(ty)
+                            = args.first().expect("has items") else { unreachable!() };
+
+                        (ty.clone(), true)
+                    }
+                } else {
+                    // a type is expected, because a field ( in this position ) should have one.
+                    unreachable!()
+                };
+
+                field.attrs.into_iter().find(|attr| {
+                    if let Meta::NameValue(MetaNameValue {
+                        path: Path { segments, .. },
+                        value,
+                        ..
+                    }) = &attr.meta
+                    {
+                        true
+                    } else {
+                        false
+                    }
+                });
+
+                GenField {
+                    ident: field.ident.expect("named fields"),
+                    ty,
+                    is_optional,
+                    each: None,
+                }
             })
             .collect::<Vec<_>>()
     } else {
@@ -58,7 +112,7 @@ fn gen_buildee_impl(
     fields: &[GenField],
 ) -> TokenStream {
     let init_struct_fields = fields.iter().map(|GenField { ident, .. }| {
-        quote! { #ident: None }
+        quote! { #ident: std::option::Option::None }
     });
 
     quote! {
@@ -80,26 +134,36 @@ fn gen_builder_impl(
     let setters = fields.iter().map(|GenField { ident, ty, .. }| {
         quote! {
             fn #ident(&mut self, #ident: #ty) -> &mut Self {
-                self.#ident = Some(#ident);
+                self.#ident = std::option::Option::Some(#ident);
                 self
             }
         }
     });
 
-    let init_struct_fields = fields.iter().map(|GenField { ident, .. }| {
-        let error_msg = format!("The field `{}` was not setted.", ident);
-        quote! {
-            #ident: self.#ident
-                .take()
-                .ok_or_else(|| String::from(#error_msg))?
-        }
-    });
+    let init_struct_fields = fields.iter().map(
+        |GenField {
+             ident, is_optional, ..
+         }| {
+            let mut init = quote! { #ident: self.#ident.take() };
+
+            if is_optional.not() {
+                let error_msg = format!("The field `{}` was not setted.", ident);
+                init = quote! {
+                    #init.ok_or_else(|| std::string::String::from(#error_msg))?
+                };
+            }
+
+            init
+        },
+    );
 
     quote! {
         impl #builder_ident {
             #(#setters)*
 
-            pub fn build(&mut self) -> Result<#buildee_ident, Box<dyn std::error::Error>> {
+            pub fn build(
+                &mut self
+            ) -> std::result::Result<#buildee_ident, std::boxed::Box<dyn std::error::Error>> {
                 std::result::Result::Ok(#buildee_ident {
                     #(#init_struct_fields),*
                 })
